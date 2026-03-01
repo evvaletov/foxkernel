@@ -1,8 +1,13 @@
 """Jupyter kernel for the COSY INFINITY FOX language.
 
 Persistent process model: a long-running cosy_jupyter binary maintains state
-across cells. Each cell execution recompiles all cells but only executes new
-code (compile-all-execute-new). CELEND intrinsic boundaries separate cells.
+across cells. Supports two compilation modes:
+
+  FULL — recompile all cells from scratch (O(N) per cell)
+  INCR — compile only the new cell, appending to existing state (O(1) per cell)
+
+Incremental mode is used automatically when possible, with transparent
+fallback to full compilation on errors, deletions, or process restarts.
 """
 
 import base64
@@ -54,10 +59,12 @@ class FoxKernel(Kernel):
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
-        self._cells = {}
+        self._cells = {}        # cell_key → code
+        self._cell_order = []   # insertion-ordered list of cell_keys
         self._cosy_dir = os.environ.get('COSY_DIR', os.getcwd())
         self._timeout = int(os.environ.get('COSY_TIMEOUT', '300'))
         self._proc = None
+        self._incr_ok = False
 
     def _find_binary(self):
         """Find the cosy_jupyter binary."""
@@ -81,6 +88,7 @@ class FoxKernel(Kernel):
             cwd=self._cosy_dir,
             bufsize=0,
         )
+        self._incr_ok = False
         return True
 
     def _kill_process(self):
@@ -92,6 +100,28 @@ class FoxKernel(Kernel):
             except (ProcessLookupError, subprocess.TimeoutExpired):
                 pass
             self._proc = None
+        self._incr_ok = False
+
+    def _send_interrupt_children(self):
+        """Forward interrupt to the COSY subprocess."""
+        if self._is_alive():
+            self._proc.send_signal(signal.SIGINT)
+        else:
+            super()._send_interrupt_children()
+
+    def _cell_key(self):
+        """Get a stable key for the current cell.
+
+        Uses Jupyter 5.5 cellId if available, falls back to execution_count.
+        """
+        try:
+            parent = self.get_parent()
+            cell_id = parent.get('content', {}).get('cellId')
+            if cell_id:
+                return cell_id
+        except (AttributeError, TypeError):
+            pass
+        return self.execution_count
 
     def _is_alive(self):
         """Check if the process is still running."""
@@ -109,7 +139,12 @@ class FoxKernel(Kernel):
 
         buf = b''
         while True:
-            ready, _, _ = select.select([fd], [], [], deadline)
+            try:
+                ready, _, _ = select.select([fd], [], [], deadline)
+            except (KeyboardInterrupt, InterruptedError):
+                if self._is_alive():
+                    self._proc.send_signal(signal.SIGINT)
+                return lines, 'interrupted'
             if not ready:
                 return lines, 'timeout'
 
@@ -128,14 +163,12 @@ class FoxKernel(Kernel):
                     return lines, 'error'
                 lines.append(line)
 
-    def _build_fox_source(self, cell_index):
-        """Build concatenated .fox source for all cells up to cell_index.
+    def _build_fox_source(self, current_key):
+        """Build concatenated .fox source for all cells up to current_key.
 
         Structure:
             INCLUDE 'COSY' ;
             <cell 1 code>
-            CELEND 0 ;
-            <cell 2 code>
             CELEND 0 ;
             ...
             <cell N code>
@@ -143,13 +176,27 @@ class FoxKernel(Kernel):
             END ;
         """
         parts = ["INCLUDE 'COSY' ;"]
-        for idx in sorted(self._cells):
-            if idx > cell_index:
+        for key in self._cell_order:
+            if key in self._cells:
+                parts.append(self._cells[key])
+                parts.append('CELEND 0 ;')
+            if key == current_key:
                 break
-            parts.append(self._cells[idx])
-            parts.append('CELEND 0 ;')
         parts.append('END ;')
         return '\n'.join(parts)
+
+    def _build_incr_source(self, current_key):
+        """Build source for incremental compilation (new cell only).
+
+        No INCLUDE or BEGIN — the compiler state is restored by CELLCK
+        to "inside BEGIN", so this code compiles as a continuation.
+        """
+        code = self._cells[current_key]
+        return f'{code}\nCELEND 0 ;\nEND ;'
+
+    def _use_incremental(self):
+        """Decide whether to use incremental compilation."""
+        return self._incr_ok and self._is_alive()
 
     def _filter_output(self, lines):
         """Remove compilation banners, keep only user-visible output."""
@@ -179,6 +226,7 @@ class FoxKernel(Kernel):
         stripped = code.strip()
         if stripped == '%reset':
             self._cells.clear()
+            self._cell_order.clear()
             self._kill_process()
             return True, 'Session reset. All cells cleared.'
         if stripped.startswith('%timeout'):
@@ -195,13 +243,25 @@ class FoxKernel(Kernel):
             if len(parts) == 2:
                 try:
                     idx = int(parts[1])
-                    if idx in self._cells:
-                        del self._cells[idx]
-                        return True, f'Deleted cell [{idx}].'
-                    return True, f'No cell [{idx}] in history.'
+                    if 1 <= idx <= len(self._cell_order):
+                        key = self._cell_order.pop(idx - 1)
+                        del self._cells[key]
+                        self._incr_ok = False
+                        return True, f'Deleted cell {idx}.'
+                    return True, f'No cell at position {idx}.'
                 except ValueError:
-                    return True, 'Usage: %delete <execution_count>'
-            return True, f'Cells in history: {sorted(self._cells.keys())}. Usage: %delete <N>'
+                    return True, 'Usage: %delete <position>'
+            return True, (f'{len(self._cell_order)} cells in history. '
+                          f'Use %cells to list. Usage: %delete <N>')
+        if stripped == '%cells':
+            if not self._cell_order:
+                return True, 'No cells in history.'
+            lines = []
+            for i, key in enumerate(self._cell_order):
+                if key in self._cells:
+                    preview = self._cells[key].split('\n', 1)[0][:60]
+                    lines.append(f'  {i + 1}: {preview}')
+            return True, '\n'.join(lines)
         if stripped.startswith('%cosy_dir'):
             parts = stripped.split(maxsplit=1)
             if len(parts) == 2:
@@ -253,8 +313,18 @@ class FoxKernel(Kernel):
                 'payload': [], 'user_expressions': {},
             }
 
-        # Store this cell
-        self._cells[self.execution_count] = code
+        # Store this cell (cell ID tracking)
+        key = self._cell_key()
+        is_new = key not in self._cells
+        if not is_new:
+            old_code = self._cells[key]
+            self._cells[key] = code
+            if old_code != code:
+                self._kill_process()
+            self._incr_ok = False
+        else:
+            self._cells[key] = code
+            self._cell_order.append(key)
 
         # Start process if needed
         if not self._is_alive():
@@ -273,8 +343,14 @@ class FoxKernel(Kernel):
 
         ps_before = self._snapshot_ps_files()
 
-        # Build source with all cells concatenated
-        source = self._build_fox_source(self.execution_count)
+        # Choose compilation mode
+        use_incr = is_new and self._use_incremental()
+        if use_incr:
+            source = self._build_incr_source(key)
+            prefix = 'INCR:'
+        else:
+            source = self._build_fox_source(key)
+            prefix = 'FULL:'
 
         # Write to temp file
         with tempfile.NamedTemporaryFile(
@@ -284,8 +360,8 @@ class FoxKernel(Kernel):
             temp_path = f.name
 
         try:
-            # Send file path to the process
-            self._proc.stdin.write((temp_path + '\n').encode())
+            # Send file path with protocol prefix
+            self._proc.stdin.write((prefix + temp_path + '\n').encode())
             self._proc.stdin.flush()
 
             # Read output until delimiter
@@ -294,6 +370,17 @@ class FoxKernel(Kernel):
             # Filter out compilation banners
             output_lines = self._filter_output(raw_lines)
             is_error = status == 'error' or self._check_errors(raw_lines)
+
+            if status == 'interrupted':
+                self._incr_ok = False
+                if not silent:
+                    self.send_response(self.iopub_socket, 'stream', {
+                        'name': 'stderr',
+                        'text': 'Execution interrupted.\n',
+                    })
+                return {
+                    'status': 'abort', 'execution_count': self.execution_count,
+                }
 
             if status == 'timeout':
                 self._kill_process()
@@ -311,6 +398,7 @@ class FoxKernel(Kernel):
 
             if status == 'died':
                 self._proc = None
+                self._incr_ok = False
                 if not silent:
                     output = '\n'.join(output_lines)
                     self.send_response(self.iopub_socket, 'stream', {
@@ -323,8 +411,11 @@ class FoxKernel(Kernel):
                     'traceback': [],
                 }
 
-            # The COSY process only executes NEW code (compile-all-execute-new),
-            # so each cell path produces exactly one <<<CELL_DONE>>>.
+            if is_error:
+                self._incr_ok = False
+            else:
+                self._incr_ok = True
+
             output = '\n'.join(output_lines).strip()
 
             if not silent and output:
